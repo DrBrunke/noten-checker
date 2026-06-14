@@ -1,0 +1,12 @@
+# Zugangsdaten & persönliche Daten -- NIEMALS committen
+.env
+noten_state.json
+page.html
+
+# Logs
+*.log
+
+# Python
+venv/
+__pycache__/
+*.pyc
