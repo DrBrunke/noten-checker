@@ -63,10 +63,16 @@ SMTP_USER       = cfg("SMTP_USER", required=True)         # deine Mail-Adresse
 SMTP_PASSWORD   = cfg("SMTP_PASSWORD", required=True)     # Mail-Passwort / App-Passwort
 MAIL_TO         = cfg("MAIL_TO", SMTP_USER)               # Empfaenger (Standard: du selbst)
 
+# --- Monitoring (optional) ---
+# Healthchecks.io Ping-URL. Leer lassen -> Monitoring aus.
+HEALTHCHECK_URL = cfg("HEALTHCHECK_URL", "")
+
 # --- Dateien ---
 BASE_DIR        = Path(__file__).resolve().parent
 STATE_FILE      = Path(cfg("STATE_FILE", str(BASE_DIR / "noten_state.json")))
 LOG_FILE        = Path(cfg("LOG_FILE", str(BASE_DIR / "noten_checker.log")))
+# Zeitstempel des letzten erfolgreichen Laufs (fuer den Waechter / watchdog.py)
+HEARTBEAT_FILE  = Path(cfg("HEARTBEAT_FILE", str(BASE_DIR / "last_success.txt")))
 
 USER_AGENT = "Mozilla/5.0 (compatible; NotenChecker/1.0)"
 
@@ -134,7 +140,8 @@ def login_and_fetch_grades() -> str:
                                   "incorrect", "ungueltige", "ungültige")):
         raise RuntimeError("Login scheint fehlgeschlagen zu sein (Fehlermeldung auf der Seite).")
 
-    # Relevanten Bereich extrahieren
+    # Relevanten Bereich extrahieren -- ZEILENWEISE (jede Tabellenzeile = eine Zeile),
+    # damit eine Aenderung nur die betroffene Zeile zeigt statt der ganzen Tabelle.
     if GRADES_SELECTOR:
         nodes = page.select(GRADES_SELECTOR)
         if not nodes:
@@ -142,7 +149,14 @@ def login_and_fetch_grades() -> str:
                 f"Selektor '{GRADES_SELECTOR}' liefert nichts. "
                 "Bist du eingeloggt? Selektor pruefen."
             )
-        text = "\n".join(n.get_text(" ", strip=True) for n in nodes)
+        rows: list[str] = []
+        for n in nodes:
+            trs = n.find_all("tr")
+            if trs:                                  # Tabelle -> jede Zeile einzeln
+                rows.extend(tr.get_text(" ", strip=True) for tr in trs)
+            else:                                    # kein <tr> -> ganzer Knoten
+                rows.append(n.get_text(" ", strip=True))
+        text = "\n".join(r for r in rows if r.strip())
     else:
         text = page.get_text("\n", strip=True)
 
@@ -188,17 +202,28 @@ def send_email(subject: str, body: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Monitoring (Healthchecks.io)
+# --------------------------------------------------------------------------- #
+def ping(suffix: str = "") -> None:
+    """Pingt Healthchecks.io an (optional). Fehler hier brechen den Job NIE ab."""
+    if not HEALTHCHECK_URL:
+        return
+    try:
+        requests.get(HEALTHCHECK_URL + suffix, timeout=10)
+    except Exception as exc:
+        log.warning("Healthcheck-Ping fehlgeschlagen: %s", exc)
+
+
+# --------------------------------------------------------------------------- #
 # Hauptlogik
 # --------------------------------------------------------------------------- #
-def main() -> None:
-    try:
-        text = login_and_fetch_grades()
-    except Exception as exc:
-        log.error("Abruf fehlgeschlagen: %s", exc)
-        sys.exit(1)
+def run_check() -> None:
+    """Eigentliche Pruefung. Wirft bei Fehlern eine Exception (siehe main)."""
+    text = login_and_fetch_grades()
 
     lines = normalize(text)
-    digest = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+    # Sortiert hashen -> reine Umsortierung der Zeilen loest KEINEN Alarm aus.
+    digest = hashlib.sha256("\n".join(sorted(lines)).encode("utf-8")).hexdigest()
 
     state = load_state()
     old_digest = state.get("digest")
@@ -231,15 +256,23 @@ def main() -> None:
     parts.append(f"Zeitpunkt: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
     body = "\n".join(parts)
 
-    try:
-        send_email("Neue Note im CAS-System!", body)
-    except Exception as exc:
-        log.error("E-Mail-Versand fehlgeschlagen: %s", exc)
-        # State NICHT aktualisieren, damit beim naechsten Lauf erneut versucht wird
-        sys.exit(1)
+    send_email("Neue Note im CAS-System!", body)
 
     save_state({"digest": digest, "lines": lines,
                 "updated": datetime.now().isoformat(timespec="seconds")})
+
+
+def main() -> None:
+    ping("/start")
+    try:
+        run_check()
+    except Exception as exc:
+        log.error("Lauf fehlgeschlagen: %s", exc)
+        ping("/fail")          # Healthchecks sofort ueber Fehler informieren
+        sys.exit(1)
+    ping()                     # Erfolg -> "ich lebe und habe sauber durchlaufen"
+    # Zeitstempel fuer den lokalen Waechter setzen (watchdog.py prueft ihn)
+    HEARTBEAT_FILE.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
 
 
 if __name__ == "__main__":
